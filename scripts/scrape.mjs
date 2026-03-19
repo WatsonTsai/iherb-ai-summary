@@ -1,4 +1,6 @@
-import { chromium } from "playwright";
+import { chromium } from "playwright-extra";
+import stealth from "puppeteer-extra-plugin-stealth";
+chromium.use(stealth());
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -55,30 +57,56 @@ function loadProducts() {
 // ── Extract AI summary from the rendered DOM ────────────
 async function extractFromDOM(page) {
   return page.evaluate(async () => {
-    const out = { summary: null, tags: [], productId: null };
+    const out = { summary: null, tags: [], productId: null, _shadowTextPreview: null };
 
     const ugcEl = document.querySelector("ugc-pdp-review");
     out.productId = ugcEl?.getAttribute("product-id") || null;
 
-    // Wait up to 10s for shadow root to appear (Stencil lazy hydration)
+    // Wait up to 15s for shadow root AND meaningful content to appear
     if (ugcEl) {
-      for (let i = 0; i < 20; i++) {
-        if (ugcEl.shadowRoot) break;
+      for (let i = 0; i < 30; i++) {
+        const sr = ugcEl.shadowRoot;
+        if (sr && sr.textContent && sr.textContent.trim().length > 50) break;
         await new Promise((r) => setTimeout(r, 500));
       }
     }
 
-    // ── Strategy 1: Read from shadow DOM ──
+    // Collect all text including nested shadow DOMs
+    function getDeepText(root) {
+      let text = "";
+      if (!root) return text;
+      for (const node of root.childNodes) {
+        if (node.nodeType === 3) { // text node
+          text += node.textContent;
+        } else if (node.nodeType === 1) { // element
+          if (node.shadowRoot) {
+            text += getDeepText(node.shadowRoot);
+          } else {
+            text += getDeepText(node);
+          }
+        }
+      }
+      return text;
+    }
+
+    // Summary must be a substantial paragraph (>80 chars), not just a heading
+    const SUMMARY_RE = /Customers?\s+(?:generally|often|frequently|commonly|love|praise|appreciate|highly|report|find|enjoy|rave|recommend|are\s+(?:very|highly|mostly|overall))\b[\s\S]{80,}?(?=Review highlights|$)/i;
+
+    function extractSummary(text) {
+      const m = text.match(SUMMARY_RE);
+      if (m) return m[0].trim();
+      // Fallback: look for text between "What customers say" and "Review highlights"
+      const between = text.match(/What customers say\s*([\s\S]{80,}?)(?=Review highlights)/i);
+      if (between) return between[1].trim();
+      return null;
+    }
+
+    // ── Strategy 1: Read from shadow DOM (with nested shadow traversal) ──
     const shadow = ugcEl?.shadowRoot;
     if (shadow) {
-      const fullText = shadow.textContent?.trim() || "";
-      // The AI summary text contains "Customers generally..." pattern
-      const match = fullText.match(
-        /Customers?\s+(generally|often|frequently|commonly|love|praise|appreciate)[\s\S]*?(?=Review highlights|$)/i
-      );
-      if (match) {
-        out.summary = match[0].trim();
-      }
+      const fullText = getDeepText(shadow);
+      out._shadowTextPreview = fullText.substring(0, 300);
+      out.summary = extractSummary(fullText);
 
       // Extract tag names from shadow DOM
       const tagEls = shadow.querySelectorAll(
@@ -94,18 +122,15 @@ async function extractFromDOM(page) {
       const allElements = document.querySelectorAll("p, div, span, section");
       for (const el of allElements) {
         const text = el.textContent?.trim() || "";
-        if (
-          text.length > 80 &&
-          text.length < 2000 &&
-          /customers?\s+(generally|often|frequently|commonly|love|praise|appreciate)/i.test(text)
-        ) {
-          // Clean: extract just the AI summary paragraph, strip trailing tag names
-          const cleaned = text.replace(/^What customers say/i, "").trim();
-          const reviewHighlightsIdx = cleaned.indexOf("Review highlights");
-          out.summary = reviewHighlightsIdx > 0
-            ? cleaned.substring(0, reviewHighlightsIdx).trim()
-            : cleaned;
-          break;
+        if (text.length > 80 && text.length < 2000) {
+          const found = extractSummary(text);
+          if (found) {
+            const reviewHighlightsIdx = found.indexOf("Review highlights");
+            out.summary = reviewHighlightsIdx > 0
+              ? found.substring(0, reviewHighlightsIdx).trim()
+              : found;
+            break;
+          }
         }
       }
     }
@@ -114,22 +139,41 @@ async function extractFromDOM(page) {
   });
 }
 
-// ── Intercept API responses for tags ────────────────────
+// ── Intercept API responses for tags + summary ──────────
 function setupApiInterceptor(page) {
-  const captured = { reviewMeta: null, tags: null };
+  const captured = { reviewMeta: null, tags: null, summary: null, _apiUrls: [] };
+
+  // Remove previous listeners to avoid stale data from prior pages
+  page.removeAllListeners("response");
 
   page.on("response", async (response) => {
     const url = response.url();
     try {
+      // Track all API calls for debugging
+      if (url.includes("api-comms") || url.includes("/api/")) {
+        captured._apiUrls.push(url.replace(/\?.*/, ""));
+      }
+
       if (url.includes("/review/summary")) {
         const data = await response.json();
         captured.reviewMeta = {
           rating: data.rating,
           productId: data.productId,
         };
+        // Check if summary text is in review/summary response
+        if (data.summary || data.aiSummary || data.customerSummary) {
+          captured.summary = data.summary || data.aiSummary || data.customerSummary;
+        }
       }
       if (url.includes("/tag/ai/")) {
         captured.tags = await response.json();
+      }
+      // Catch any response containing AI summary text
+      if (url.includes("summary") || url.includes("ugc") || url.includes("ai")) {
+        const text = await response.text();
+        if (text.includes("Customers generally") || text.includes("Customers often") || text.includes("customers praise")) {
+          try { captured.summary = JSON.parse(text); } catch { captured.summary = text; }
+        }
       }
     } catch {
       // ignore parse errors
@@ -169,7 +213,16 @@ async function main() {
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     viewport: { width: 1280, height: 800 },
     locale: "en-US",
+    extraHTTPHeaders: {
+      "Accept-Language": "en-US,en;q=0.9",
+    },
   });
+
+  // Force English locale via cookies to prevent redirect to tw.iherb.com
+  await context.addCookies([
+    { name: "iherb.locale", value: "en-US", domain: ".iherb.com", path: "/" },
+    { name: "ih-preference", value: "%7B%22country%22%3A%22US%22%2C%22language%22%3A%22en-US%22%2C%22currency%22%3A%22USD%22%7D", domain: ".iherb.com", path: "/" },
+  ]);
 
   // Remove webdriver flag
   await context.addInitScript(() => {
@@ -219,9 +272,9 @@ async function main() {
         timeout: PAGE_TIMEOUT,
       });
 
-      // Wait for possible redirect to settle
-      await sleep(2000);
-      await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
+      // Wait for possible redirect to settle, then ensure page is stable
+      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+      await sleep(1000);
 
       // Scroll down to trigger lazy-loaded components
       await page.evaluate(() => {
@@ -234,18 +287,30 @@ async function main() {
         }
       });
 
-      // Wait for component to hydrate
-      await sleep(5000);
+      // Wait for ugc-pdp-review shadow root to appear (up to 15s), then a short settle
+      try {
+        await page.waitForFunction(
+          () => {
+            const el = document.querySelector("ugc-pdp-review");
+            return el?.shadowRoot?.textContent?.trim().length > 50;
+          },
+          { timeout: 15_000 }
+        );
+      } catch {
+        // Component may not exist on this page — continue with extraction anyway
+      }
+      await sleep(1000);
 
       // Extract from DOM (primary source for AI summary text)
       const domResult = await extractFromDOM(page);
 
-      // Build clean entry
+      // Build clean entry — prefer DOM summary, fallback to API-captured summary
+      const summary = domResult.summary || (typeof captured.summary === "string" ? captured.summary : null);
       const entry = {
         productId: product.id,
         scrapedAt: new Date().toISOString(),
         url: await page.url(),
-        summary: domResult.summary || null,
+        summary,
         tags: [],
         rating: captured.reviewMeta?.rating || null,
       };
@@ -271,6 +336,11 @@ async function main() {
       }
       if (entry.tags.length > 0) {
         console.log(`   Tags: [${entry.tags.join(", ")}]`);
+      }
+      if (DEBUG && !entry.summary) {
+        console.log(`   [debug] Shadow text: ${JSON.stringify(domResult._shadowTextPreview?.substring(0, 200) || "(none)")}`);
+        console.log(`   [debug] API URLs: ${captured._apiUrls?.join(", ") || "(none)"}`);
+        console.log(`   [debug] API summary: ${captured.summary ? "found" : "none"}`);
       }
     } catch (e) {
       console.error(`   ❌ Error: ${e.message}`);

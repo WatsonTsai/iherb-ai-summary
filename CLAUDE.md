@@ -28,7 +28,7 @@ iHerb 產品頁面上有一個 "What Customers Say" 區塊，包含：
 ## Tech Stack
 
 - **Node.js** (ESM, .mjs)
-- **Playwright** — 瀏覽器自動化，繞過 Cloudflare 保護
+- **Playwright** (via `playwright-extra` + stealth plugin) — 瀏覽器自動化，繞過 Cloudflare 保護
 - **better-sqlite3** — 讀取 iherb.db 產品資料
 
 ## Key Commands
