@@ -12,10 +12,16 @@ iherb-ai-summary/
 │   └── iherb.db                    # iHerb 產品 SQLite DB (50,165 筆, not in git)
 ├── data/
 │   ├── products.json               # 待爬取產品清單 (generated)
-│   └── summaries.json              # 爬取結果 (not in git)
+│   └── summaries.jsonl             # 爬取結果 JSONL (not in git, append-only)
 ├── scripts/
 │   ├── generate-products.mjs       # 從 DB 產生產品清單
-│   └── scrape.mjs                  # Playwright 爬蟲主程式
+│   ├── scrape.mjs                  # Playwright 爬蟲主程式
+│   ├── convert-to-jsonl.mjs        # 一次性遷移: summaries.json → .jsonl
+│   ├── stats.mjs                   # JSONL 統計摘要
+│   └── lib/
+│       └── extract.mjs             # 共用 regex patterns + extractSummary()
+├── tests/
+│   └── extract.test.mjs            # extractSummary 單元測試 (node:test)
 ├── docs/
 │   └── 20260319_scraper_analysis_and_plan.md  # 本文件
 └── SETUP.md                        # 環境建置指南
@@ -39,29 +45,39 @@ iherb-ai-summary/
 │  │  ├─ DOM: ugc-pdp-review shadow DOM → AI summary 文字
 │  │  ├─ API 攔截: /tag/ai/{id} → Review Highlights 標籤
 │  │  └─ API 攔截: /review/summary → 評分統計
+│  ├─ 穩定性機制:
+│  │  ├─ Exponential backoff 重試 (3 次, 2/4/8s + jitter)
+│  │  ├─ Page 回收 (每 50 筆) + Context 回收 (每 200 筆)
+│  │  ├─ 連續失敗偵測 → 自動暫停 + session 重建
+│  │  ├─ Route abort (攔截圖片/CSS/字型，減少記憶體)
+│  │  └─ Summary 最短長度驗證 (防止誤提取)
 │  ├─ Input: data/products.json
-│  └─ Output: data/summaries.json (增量寫入)
+│  └─ Output: data/summaries.jsonl (JSONL, append-only)
 │
-└─ 📁 OUTPUT: data/summaries.json
+├─ Step3: stats.mjs
+│  ├─ 目的: 統計爬取結果
+│  └─ 指令: npm run stats
+│
+└─ 📁 OUTPUT: data/summaries.jsonl
 ```
 
-## JSON 輸出架構
+## JSONL 輸出架構
 
-```json
-{
-  "62118": {
-    "productId": 62118,
-    "scrapedAt": "2026-03-19T08:24:37.545Z",
-    "url": "https://tw.iherb.com/pr/.../62118",       // 實際 URL (可能被 redirect)
-    "summary": "Customers generally praise this...",    // AI 摘要文字 | null
-    "tags": ["No fishy taste", "Easy swallow"],         // Review Highlights 標籤
-    "rating": {                                         // 評分統計 | null
-      "averageRating": 4.8,
-      "count": 477434
-    }
-  }
-}
+每行一筆 JSON（append-only，不重寫整個檔案）：
+
+```jsonl
+{"productId":62118,"scrapedAt":"2026-03-19T08:24:37.545Z","url":"https://tw.iherb.com/pr/.../62118","summary":"Customers generally praise this...","tags":["No fishy taste","Easy swallow"],"rating":null}
+{"productId":16035,"scrapedAt":"2026-03-19T08:25:12.000Z","url":"https://tw.iherb.com/pr/.../16035","summary":null,"tags":[],"rating":null}
 ```
+
+欄位說明：
+- `productId` — 產品 ID (number)
+- `scrapedAt` — 爬取時間 (ISO 8601)
+- `url` — 實際 URL (可能被 redirect 到 tw.iherb.com)
+- `summary` — AI 摘要文字 | null
+- `tags` — Review Highlights 標籤陣列
+- `rating` — 評分統計 | null
+- `error` — 錯誤訊息（僅在失敗時出現）
 
 ## 問題分析與修復紀錄
 
@@ -152,7 +168,7 @@ iherb-ai-summary/
 - 已整合 `playwright-extra` + `puppeteer-extra-plugin-stealth`
 - **Headless 模式可自動通過 Cloudflare**，不需人工介入 (2026-03-19 驗證)
 - `cf_clearance` cookie 有效期約 **30-60 分鐘**
-- 建議每 45 分鐘（約 150-200 筆產品）重新建立 session
+- Scraper 每 200 筆自動回收 context 並重建 session（約 50 分鐘），在 cookie 過期前刷新
 - 若 stealth 未來失效，退回 `npm run scrape:debug` 人工通過
 
 ## 全量爬取執行計畫
@@ -185,41 +201,38 @@ node scripts/scrape.mjs
 ### Phase 3: 品質驗證與清理
 
 ```bash
-node -e "
-const d = JSON.parse(require('fs').readFileSync('data/summaries.json'));
-const total = Object.keys(d).length;
-const withSummary = Object.values(d).filter(v => v.summary).length;
-const withTags = Object.values(d).filter(v => v.tags?.length > 0).length;
-const errors = Object.values(d).filter(v => v.error).length;
-console.log('Total:', total);
-console.log('With summary:', withSummary, '(' + (withSummary/total*100).toFixed(1) + '%)');
-console.log('With tags:', withTags, '(' + (withTags/total*100).toFixed(1) + '%)');
-console.log('Errors:', errors);
-"
+npm run stats                    # 統計 summaries.jsonl 的 summary/tags/error 分布
 ```
 
-## 建議的後續改進
+## 改進追蹤
 
-依優先度排列：
+### 已完成
+
+| 優先度 | 改進項目 | 狀態 |
+|--------|---------|------|
+| P0 | Exponential backoff 重試 (3 次, 2/4/8s + jitter) | ✅ 已實作 |
+| P0 | Page 回收 (每 50 筆) + Context 回收 (每 200 筆) | ✅ 已實作 |
+| P0 | Memory 監控 (heap 用量記錄) | ✅ 已實作 |
+| P1 | 儲存格式改 JSONL (append-only) | ✅ 已實作 |
+| P1 | 進度追蹤 + ETA 預估 (每 50 筆) | ✅ 已實作 |
+| P1 | 圖片/CSS/字型 route abort | ✅ 已實作 |
+| P1 | Schema validation (summary 最短長度) | ✅ 已實作 |
+| P2 | 連續失敗偵測 + session 自動重建 | ✅ 已實作 |
+| — | extractSummary 共用模組 + 單元測試 | ✅ 已實作 |
+| — | JSONL 統計腳本 (npm run stats) | ✅ 已實作 |
+
+### 尚未實作
 
 | 優先度 | 改進項目 | 原因 |
 |--------|---------|------|
-| P0 | Exponential backoff 重試 (3 次, 2/4/8s + jitter) | 減少暫時性失敗損失，業界標準做法 |
-| P0 | 每 100 頁回收 page 物件，每 500 頁回收 context | 防止長時間運行 memory leak |
-| P0 | Memory 監控 (每 50 筆記錄 heap 用量) | 及早發現 leak，>500MB 時告警 |
-| P1 | 儲存格式改 JSONL (append-only) 或 SQLite | 目前每次寫入重寫整個 JSON，50K 筆時 I/O 瓶頸嚴重 |
-| P1 | 進度追蹤 progress.json (每 50 筆存檔) | 支援中斷恢復 + 預估完成時間 |
-| P1 | 圖片/CSS route abort | 減少 ~20-30% 記憶體用量 |
-| P1 | Schema validation (summary 長度、URL 格式) | 及早發現系統性抓取問題 |
-| P2 | 2-3 個 browser context 並行 (非 browser instance) | 約 2.5x 加速，共享記憶體 |
-| P2 | cf_clearance 45 分鐘自動換 context + cookie 持久化 | 避免 session 過期，減少人工介入 |
-| P2 | Circuit breaker (連續 5 個 429 暫停 5 分鐘) | 避免被永久封鎖 |
-| P2 | Batch 間長延遲 (每 50-100 筆暫停 15-30 秒) | 打破固定 request pattern |
+| P2 | 2-3 個 browser context 並行 | 約 2.5x 加速，但複雜度高，建議先確認單線程穩定 |
+| P2 | Batch 間長延遲 (每 50-100 筆暫停 15-30 秒) | 打破固定 request pattern，降低被封鎖風險 |
 
 ## 注意事項
 
 - **Cloudflare**: stealth plugin 目前可自動通過；若未來失效，改用 `npm run scrape:debug` 人工通過
 - **增量模式**: 預設跳過已爬取的產品，使用 `--force` 強制重爬
 - **台灣 IP**: 會被 redirect 到 `tw.iherb.com`，不影響功能但 URL 會不同
-- **data/summaries.json**: 不進 git (已在 .gitignore)，是累積式檔案，勿手動刪除
+- **data/summaries.jsonl**: 不進 git (已在 .gitignore)，是 append-only 累積式檔案，勿手動刪除
+- **舊格式遷移**: 若有 `data/summaries.json`，用 `npm run convert` 轉為 JSONL
 - **低評論產品**: 10-99 則評論的產品覆蓋率為 0%，不建議爬取

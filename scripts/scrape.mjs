@@ -1,13 +1,14 @@
 import { chromium } from "playwright-extra";
 import stealth from "puppeteer-extra-plugin-stealth";
 chromium.use(stealth());
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { SUMMARY_PATTERN, FALLBACK_PATTERN } from "./lib/extract.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, "..", "data");
-const RESULTS_FILE = join(DATA_DIR, "summaries.json");
+const RESULTS_FILE = join(DATA_DIR, "summaries.jsonl");
 const PRODUCTS_FILE = join(DATA_DIR, "products.json");
 
 const DEBUG = !!process.env.DEBUG;
@@ -18,6 +19,17 @@ const HEADLESS = !DEBUG; // Show browser in debug mode
 const BASE_URL = "https://www.iherb.com";
 const DELAY_BETWEEN_PAGES = [3000, 6000]; // random delay range (ms)
 const PAGE_TIMEOUT = 30_000;
+const RETRY_ATTEMPTS = 3;
+const RETRY_BASE_DELAY = 2000;
+const PAGE_RECYCLE_INTERVAL = 50;
+const CONTEXT_RECYCLE_INTERVAL = 200;
+const MIN_SUMMARY_LENGTH = 20;
+const CONSECUTIVE_FAIL_THRESHOLD = 3;
+const SESSION_REFRESH_PAUSE = 60_000;
+
+// Resource types and URL patterns to block (saves memory & bandwidth)
+const BLOCKED_RESOURCE_TYPES = ["image", "media", "font"];
+const BLOCKED_URL_PATTERNS = /\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|css)(\?|$)/i;
 
 // ── Helpers ─────────────────────────────────────────────
 function sleep(ms) {
@@ -29,15 +41,35 @@ function randomDelay() {
   return Math.floor(Math.random() * (max - min) + min);
 }
 
-function loadResults() {
-  if (existsSync(RESULTS_FILE)) {
-    return JSON.parse(readFileSync(RESULTS_FILE, "utf-8"));
-  }
-  return {};
+function isRetryableError(err) {
+  const msg = (err.message || "").toLowerCase();
+  return /timeout|net::|err_|econnrefused|econnreset|navigation failed|target closed|session closed/.test(msg);
 }
 
-function saveResults(results) {
-  writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2), "utf-8");
+function retryDelay(attempt) {
+  const base = RETRY_BASE_DELAY * Math.pow(2, attempt); // 2s, 4s, 8s
+  const jitter = Math.random() * base * 0.5;
+  return base + jitter;
+}
+
+function isPageClosed(err) {
+  const msg = (err.message || "").toLowerCase();
+  return /target closed|session closed/.test(msg);
+}
+
+// ── JSONL I/O ───────────────────────────────────────────
+function loadScrapedIds() {
+  if (!existsSync(RESULTS_FILE)) return new Set();
+  const lines = readFileSync(RESULTS_FILE, "utf-8").split("\n").filter(Boolean);
+  const ids = new Set();
+  for (const line of lines) {
+    try { ids.add(String(JSON.parse(line).productId)); } catch {}
+  }
+  return ids;
+}
+
+function appendResult(entry) {
+  appendFileSync(RESULTS_FILE, JSON.stringify(entry) + "\n", "utf-8");
 }
 
 function loadProducts() {
@@ -54,9 +86,71 @@ function loadProducts() {
   return JSON.parse(readFileSync(PRODUCTS_FILE, "utf-8"));
 }
 
+// ── Browser context factory ─────────────────────────────
+async function createContext(browser) {
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    viewport: { width: 1280, height: 800 },
+    locale: "en-US",
+    extraHTTPHeaders: {
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+  });
+
+  // Force English locale via cookies to prevent redirect to tw.iherb.com
+  await context.addCookies([
+    { name: "iherb.locale", value: "en-US", domain: ".iherb.com", path: "/" },
+    { name: "ih-preference", value: "%7B%22country%22%3A%22US%22%2C%22language%22%3A%22en-US%22%2C%22currency%22%3A%22USD%22%7D", domain: ".iherb.com", path: "/" },
+  ]);
+
+  // Remove webdriver flag
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+  });
+
+  // Block images, fonts, CSS to save memory and bandwidth
+  await context.route("**/*", (route) => {
+    const req = route.request();
+    if (
+      BLOCKED_RESOURCE_TYPES.includes(req.resourceType()) ||
+      BLOCKED_URL_PATTERNS.test(req.url())
+    ) {
+      return route.abort();
+    }
+    return route.continue();
+  });
+
+  return context;
+}
+
+// ── Session establishment (Cloudflare) ──────────────────
+async function establishSession(page) {
+  console.log("🌐 Visiting iHerb homepage to establish session...");
+  try {
+    await page.goto(BASE_URL, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT });
+    await sleep(3000);
+
+    const title = await page.title();
+    if (title.includes("moment") || title.includes("Just a")) {
+      console.log("⏳ Cloudflare challenge detected. Waiting for it to resolve...");
+      console.log("   (If headless, try running with: npm run scrape:debug)\n");
+      await page.waitForURL("**/iherb.com/**", { timeout: 60_000 });
+      await sleep(2000);
+    }
+    console.log(`✅ Session established: ${await page.title()}\n`);
+    return true;
+  } catch (e) {
+    console.error("❌ Failed to establish session:", e.message);
+    console.log("   Try running with: npm run scrape:debug (opens visible browser)");
+    return false;
+  }
+}
+
 // ── Extract AI summary from the rendered DOM ────────────
 async function extractFromDOM(page) {
-  return page.evaluate(async () => {
+  return page.evaluate(async (patterns) => {
+    const { summaryPattern, fallbackPattern } = patterns;
     const out = { summary: null, tags: [], productId: null, _shadowTextPreview: null };
 
     const ugcEl = document.querySelector("ugc-pdp-review");
@@ -89,14 +183,14 @@ async function extractFromDOM(page) {
       return text;
     }
 
-    // Summary must be a substantial paragraph (>80 chars), not just a heading
-    const SUMMARY_RE = /Customers?\s+(?:generally|often|frequently|commonly|love|praise|appreciate|highly|report|find|enjoy|rave|recommend|are\s+(?:very|highly|mostly|overall))\b[\s\S]{80,}?(?=Review highlights|$)/i;
+    // Rebuild regex from pattern strings (cannot pass RegExp across evaluate boundary)
+    const SUMMARY_RE = new RegExp(summaryPattern, "i");
+    const FALLBACK_RE = new RegExp(fallbackPattern, "i");
 
     function extractSummary(text) {
       const m = text.match(SUMMARY_RE);
       if (m) return m[0].trim();
-      // Fallback: look for text between "What customers say" and "Review highlights"
-      const between = text.match(/What customers say\s*([\s\S]{80,}?)(?=Review highlights)/i);
+      const between = text.match(FALLBACK_RE);
       if (between) return between[1].trim();
       return null;
     }
@@ -136,7 +230,7 @@ async function extractFromDOM(page) {
     }
 
     return out;
-  });
+  }, { summaryPattern: SUMMARY_PATTERN, fallbackPattern: FALLBACK_PATTERN });
 }
 
 // ── Intercept API responses for tags + summary ──────────
@@ -183,18 +277,35 @@ function setupApiInterceptor(page) {
   return captured;
 }
 
+// ── Progress report ─────────────────────────────────────
+function logProgress(i, total, successCount, errorCount, startTime) {
+  const elapsed = Date.now() - startTime;
+  const avgMs = elapsed / i;
+  const remaining = total - i;
+  const etaMin = Math.round((remaining * avgMs) / 60_000);
+  const heapMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+  console.log(`\n📊 Progress: ${i}/${total} (${(i / total * 100).toFixed(1)}%)`);
+  console.log(`   Success: ${successCount}, Errors: ${errorCount}, Heap: ${heapMB} MB`);
+  console.log(`   ETA: ~${etaMin} min (avg ${(avgMs / 1000).toFixed(1)}s/product)`);
+}
+
 // ── Main ────────────────────────────────────────────────
 async function main() {
   const products = loadProducts();
-  const results = loadResults();
+  const scrapedIds = loadScrapedIds();
 
   console.log(`📦 Loaded ${products.length} products`);
-  console.log(`📁 Existing results: ${Object.keys(results).length}`);
+  console.log(`📁 Existing results: ${scrapedIds.size}`);
+
+  // --force: truncate existing file
+  if (FORCE && existsSync(RESULTS_FILE)) {
+    writeFileSync(RESULTS_FILE, "", "utf-8");
+  }
 
   // Filter out already-scraped products (unless --force)
   const todo = FORCE
     ? products
-    : products.filter((p) => !results[String(p.id)]);
+    : products.filter((p) => !scrapedIds.has(String(p.id)));
   console.log(`🔍 To scrape: ${todo.length}${FORCE ? " (--force)" : ""}\n`);
 
   if (todo.length === 0) {
@@ -208,160 +319,208 @@ async function main() {
     args: ["--disable-blink-features=AutomationControlled"],
   });
 
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    viewport: { width: 1280, height: 800 },
-    locale: "en-US",
-    extraHTTPHeaders: {
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
+  let context = await createContext(browser);
+  let page = await context.newPage();
 
-  // Force English locale via cookies to prevent redirect to tw.iherb.com
-  await context.addCookies([
-    { name: "iherb.locale", value: "en-US", domain: ".iherb.com", path: "/" },
-    { name: "ih-preference", value: "%7B%22country%22%3A%22US%22%2C%22language%22%3A%22en-US%22%2C%22currency%22%3A%22USD%22%7D", domain: ".iherb.com", path: "/" },
-  ]);
-
-  // Remove webdriver flag
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => false });
-  });
-
-  const page = await context.newPage();
-
-  // First visit: go to homepage to get cookies / pass Cloudflare
-  console.log("🌐 Visiting iHerb homepage to establish session...");
-  try {
-    await page.goto(BASE_URL, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT });
-    await sleep(3000);
-
-    // Check if we hit Cloudflare challenge
-    const title = await page.title();
-    if (title.includes("moment") || title.includes("Just a")) {
-      console.log("⏳ Cloudflare challenge detected. Waiting for it to resolve...");
-      console.log("   (If headless, try running with: npm run scrape:debug)\n");
-      await page.waitForURL("**/iherb.com/**", { timeout: 60_000 });
-      await sleep(2000);
-    }
-    console.log(`✅ Session established: ${await page.title()}\n`);
-  } catch (e) {
-    console.error("❌ Failed to establish session:", e.message);
-    console.log("   Try running with: npm run scrape:debug (opens visible browser)");
+  if (!await establishSession(page)) {
     await browser.close();
     return;
   }
 
+  let successCount = 0;
+  let errorCount = 0;
+  let consecutiveFails = 0;
+  const startTime = Date.now();
+
   // Scrape each product
-  for (const product of todo) {
+  for (let i = 0; i < todo.length; i++) {
+    const product = todo[i];
     const productId = String(product.id);
     const productUrl = product.url.startsWith("http")
       ? product.url
       : `${BASE_URL}${product.url}`;
 
-    console.log(`── Scraping product ${productId} ──`);
+    // ── Context recycling (every 200 products) ──
+    if (i > 0 && i % CONTEXT_RECYCLE_INTERVAL === 0) {
+      logProgress(i, todo.length, successCount, errorCount, startTime);
+      console.log(`🔄 Recycling context (after ${i} products)...`);
+      await context.close();
+      context = await createContext(browser);
+      page = await context.newPage();
+      await establishSession(page);
+    }
+    // ── Page recycling (every 50 products, skip if context just recycled) ──
+    else if (i > 0 && i % PAGE_RECYCLE_INTERVAL === 0) {
+      logProgress(i, todo.length, successCount, errorCount, startTime);
+      console.log(`♻️  Recycling page...`);
+      await page.close();
+      page = await context.newPage();
+    }
+
+    console.log(`── [${i + 1}/${todo.length}] Scraping product ${productId} ──`);
     console.log(`   URL: ${productUrl}`);
 
-    // Set up API response interceptor
-    const captured = setupApiInterceptor(page);
+    // ── Retry loop ──
+    for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
+      // Set up API response interceptor
+      const captured = setupApiInterceptor(page);
 
-    try {
-      await page.goto(productUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: PAGE_TIMEOUT,
-      });
-
-      // Wait for possible redirect to settle, then ensure page is stable
-      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
-      await sleep(1000);
-
-      // Scroll down to trigger lazy-loaded components
-      await page.evaluate(() => {
-        const ugc = document.querySelector("ugc-pdp-review");
-        if (ugc) {
-          ugc.scrollIntoView({ behavior: "instant", block: "center" });
-        } else {
-          // Scroll to bottom half of page to trigger lazy loads
-          window.scrollTo(0, document.body.scrollHeight * 0.6);
-        }
-      });
-
-      // Wait for ugc-pdp-review shadow root to appear (up to 15s), then a short settle
       try {
-        await page.waitForFunction(
-          () => {
-            const el = document.querySelector("ugc-pdp-review");
-            return el?.shadowRoot?.textContent?.trim().length > 50;
-          },
-          { timeout: 15_000 }
-        );
-      } catch {
-        // Component may not exist on this page — continue with extraction anyway
-      }
-      await sleep(1000);
+        await page.goto(productUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: PAGE_TIMEOUT,
+        });
 
-      // Extract from DOM (primary source for AI summary text)
-      const domResult = await extractFromDOM(page);
+        // Wait for possible redirect to settle, then ensure page is stable
+        await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+        await sleep(1000);
 
-      // Build clean entry — prefer DOM summary, fallback to API-captured summary
-      const summary = domResult.summary || (typeof captured.summary === "string" ? captured.summary : null);
-      const entry = {
-        productId: product.id,
-        scrapedAt: new Date().toISOString(),
-        url: await page.url(),
-        summary,
-        tags: [],
-        rating: captured.reviewMeta?.rating || null,
-      };
+        // Scroll down to trigger lazy-loaded components
+        await page.evaluate(() => {
+          const ugc = document.querySelector("ugc-pdp-review");
+          if (ugc) {
+            ugc.scrollIntoView({ behavior: "instant", block: "center" });
+          } else {
+            // Scroll to bottom half of page to trigger lazy loads
+            window.scrollTo(0, document.body.scrollHeight * 0.6);
+          }
+        });
 
-      // Tags: prefer intercepted API data, fallback to DOM
-      if (captured.tags?.tags && Array.isArray(captured.tags.tags)) {
-        entry.tags = captured.tags.tags.map((t) => t.name);
-      } else if (domResult.tags.length > 0) {
-        entry.tags = domResult.tags;
-      }
+        // Wait for ugc-pdp-review shadow root to appear (up to 15s), then a short settle
+        try {
+          await page.waitForFunction(
+            () => {
+              const el = document.querySelector("ugc-pdp-review");
+              return el?.shadowRoot?.textContent?.trim().length > 50;
+            },
+            { timeout: 15_000 }
+          );
+        } catch {
+          // Component may not exist on this page — continue with extraction anyway
+        }
+        await sleep(1000);
 
-      if (DEBUG) {
-        entry._debug = { domResult, captured };
-      }
+        // Extract from DOM (primary source for AI summary text)
+        const domResult = await extractFromDOM(page);
 
-      results[productId] = entry;
-      saveResults(results);
+        // Build clean entry — prefer DOM summary, fallback to API-captured summary
+        let summary = domResult.summary || (typeof captured.summary === "string" ? captured.summary : null);
+        if (summary && summary.length < MIN_SUMMARY_LENGTH) {
+          console.log(`   ⚠ Summary too short (${summary.length} chars), discarding: "${summary}"`);
+          summary = null;
+        }
+        const entry = {
+          productId: product.id,
+          scrapedAt: new Date().toISOString(),
+          url: await page.url(),
+          summary,
+          tags: [],
+          rating: captured.reviewMeta?.rating || null,
+        };
 
-      const status = entry.summary ? "✅" : "⚠️  no summary found";
-      console.log(`   ${status}`);
-      if (entry.summary) {
-        console.log(`   Summary: ${entry.summary.substring(0, 120)}...`);
+        // Tags: prefer intercepted API data, fallback to DOM
+        if (captured.tags?.tags && Array.isArray(captured.tags.tags)) {
+          entry.tags = captured.tags.tags.map((t) => t.name);
+        } else if (domResult.tags.length > 0) {
+          entry.tags = domResult.tags;
+        }
+
+        if (DEBUG) {
+          entry._debug = { domResult, captured };
+        }
+
+        appendResult(entry);
+        successCount++;
+
+        // ── Consecutive failure detection (empty results = soft fail) ──
+        if (!entry.summary && (!entry.tags || entry.tags.length === 0)) {
+          consecutiveFails++;
+        } else {
+          consecutiveFails = 0;
+        }
+
+        const status = entry.summary ? "✅" : "⚠️  no summary found";
+        console.log(`   ${status}`);
+        if (entry.summary) {
+          console.log(`   Summary: ${entry.summary.substring(0, 120)}...`);
+        }
+        if (entry.tags.length > 0) {
+          console.log(`   Tags: [${entry.tags.join(", ")}]`);
+        }
+        if (DEBUG && !entry.summary) {
+          console.log(`   [debug] Shadow text: ${JSON.stringify(domResult._shadowTextPreview?.substring(0, 200) || "(none)")}`);
+          console.log(`   [debug] API URLs: ${captured._apiUrls?.join(", ") || "(none)"}`);
+          console.log(`   [debug] API summary: ${captured.summary ? "found" : "none"}`);
+        }
+
+        break; // success — exit retry loop
+
+      } catch (e) {
+        const retryable = isRetryableError(e);
+        const lastAttempt = attempt >= RETRY_ATTEMPTS - 1;
+
+        if (retryable && !lastAttempt) {
+          const delay = retryDelay(attempt);
+          console.log(`   ⚠️  Retryable error (attempt ${attempt + 1}/${RETRY_ATTEMPTS}): ${e.message}`);
+          console.log(`   ⏳ Retrying in ${Math.round(delay)}ms...`);
+
+          // Rebuild page if it was destroyed
+          if (isPageClosed(e)) {
+            console.log(`   🔄 Page closed — recreating...`);
+            try { await page.close(); } catch {}
+            page = await context.newPage();
+          }
+
+          await sleep(delay);
+          continue;
+        }
+
+        // Not retryable or final attempt — log error and move on
+        console.error(`   ❌ Error: ${e.message}`);
+        appendResult({
+          productId: product.id,
+          scrapedAt: new Date().toISOString(),
+          error: e.message,
+        });
+        errorCount++;
+        consecutiveFails++;
+
+        // Rebuild page if closed
+        if (isPageClosed(e)) {
+          try { await page.close(); } catch {}
+          page = await context.newPage();
+        }
+
+        break;
       }
-      if (entry.tags.length > 0) {
-        console.log(`   Tags: [${entry.tags.join(", ")}]`);
-      }
-      if (DEBUG && !entry.summary) {
-        console.log(`   [debug] Shadow text: ${JSON.stringify(domResult._shadowTextPreview?.substring(0, 200) || "(none)")}`);
-        console.log(`   [debug] API URLs: ${captured._apiUrls?.join(", ") || "(none)"}`);
-        console.log(`   [debug] API summary: ${captured.summary ? "found" : "none"}`);
-      }
-    } catch (e) {
-      console.error(`   ❌ Error: ${e.message}`);
-      results[productId] = {
-        productId: product.id,
-        scrapedAt: new Date().toISOString(),
-        error: e.message,
-      };
-      saveResults(results);
+    }
+
+    // ── Session health check: pause & refresh on consecutive failures ──
+    if (consecutiveFails >= CONSECUTIVE_FAIL_THRESHOLD) {
+      console.log(`\n⚠️  ${consecutiveFails} consecutive empty results — session may be stale`);
+      console.log(`   Pausing ${SESSION_REFRESH_PAUSE / 1000}s and recycling context...`);
+      await sleep(SESSION_REFRESH_PAUSE);
+
+      // Full context rebuild
+      await context.close();
+      context = await createContext(browser);
+      page = await context.newPage();
+      await establishSession(page);
+      consecutiveFails = 0;
     }
 
     // Random delay between pages
-    if (todo.indexOf(product) < todo.length - 1) {
+    if (i < todo.length - 1) {
       const delay = randomDelay();
       console.log(`   ⏳ Waiting ${delay}ms...\n`);
       await sleep(delay);
     }
   }
 
-  console.log(`\n🏁 Done! Results saved to ${RESULTS_FILE}`);
-  console.log(`   Total entries: ${Object.keys(results).length}`);
+  const heapMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+  console.log(`\n🏁 Done! Results appended to ${RESULTS_FILE}`);
+  console.log(`   Success: ${successCount}, Errors: ${errorCount}`);
+  console.log(`   Final heap: ${heapMB} MB`);
   await browser.close();
 }
 

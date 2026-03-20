@@ -1,3 +1,13 @@
 node_modules/
 input/
 data/summaries.json
+data/summaries.jsonl
+
+# Environment & editor
+.env*
+*.log
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~

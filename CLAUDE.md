@@ -37,6 +37,9 @@ iHerb 產品頁面上有一個 "What Customers Say" 區塊，包含：
 npm run generate                        # 從 DB 生成 products.json
 npm run scrape                          # Headless 爬取
 npm run scrape:debug                    # 開瀏覽器視窗爬取
+npm run stats                           # 統計 summaries.jsonl 結果分布
+npm run convert                         # 一次性遷移 summaries.json → .jsonl
+npm test                                # 執行 extractSummary 單元測試
 node scripts/scrape.mjs --force         # 強制重爬
 node scripts/generate-products.mjs --min-reviews 5000 --limit 50
 ```
@@ -47,4 +50,6 @@ node scripts/generate-products.mjs --min-reviews 5000 --limit 50
 - `/review/summary/v2` 回傳的是評論統計資料（rating, top reviews），腳本只取其中的 rating
 - `/tag/ai/{id}` 回傳的 tag 陣列才是 Review Highlights
 - 爬蟲支援增量模式：已爬取的產品會跳過，除非使用 `--force`
-- `data/summaries.json` 不進 git，`input/` 不進 git
+- 輸出格式為 JSONL（每行一筆 JSON，append-only），避免大量資料時的 I/O 瓶頸
+- Regex patterns 定義在 `scripts/lib/extract.mjs`，scrape.mjs 透過參數傳入 browser context
+- `data/summaries.jsonl` 不進 git，`input/` 不進 git
