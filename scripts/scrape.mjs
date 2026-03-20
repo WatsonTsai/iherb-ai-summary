@@ -13,6 +13,7 @@ const PRODUCTS_FILE = join(DATA_DIR, "products.json");
 
 const DEBUG = !!process.env.DEBUG;
 const FORCE = process.argv.includes("--force");
+const DRY_RUN = process.argv.includes("--dry-run");
 const HEADLESS = !DEBUG; // Show browser in debug mode
 
 // ── Config ──────────────────────────────────────────────
@@ -26,19 +27,46 @@ const CONTEXT_RECYCLE_INTERVAL = 200;
 const MIN_SUMMARY_LENGTH = 20;
 const CONSECUTIVE_FAIL_THRESHOLD = 3;
 const SESSION_REFRESH_PAUSE = 60_000;
+const BATCH_PAUSE_INTERVAL = [80, 120]; // pause every N products (random range)
+const BATCH_PAUSE_DURATION = [30_000, 90_000]; // pause duration (ms, random range)
 
 // Resource types and URL patterns to block (saves memory & bandwidth)
 const BLOCKED_RESOURCE_TYPES = ["image", "media", "font"];
 const BLOCKED_URL_PATTERNS = /\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|css)(\?|$)/i;
+
+// UA pool — rotated on each context creation
+const USER_AGENTS = [
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+];
+
+// Canary products — known to have AI summaries, tested before full run
+const CANARY_PRODUCTS = [
+  { id: 62118, url: "/pr/california-gold-nutrition-omega-3-premium-fish-oil-100-fish-gelatin-softgels-1-100-mg-per-softgel/62118" },
+  { id: 64902, url: "/pr/california-gold-nutrition-collagenup-hydrolyzed-marine-collagen-peptides-with-hyaluronic-acid-and-vitamin-c-unflavored-1-02-lb-464-g/64902" },
+];
 
 // ── Helpers ─────────────────────────────────────────────
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min) + min);
+}
+
+function randomFrom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
 function randomDelay() {
   const [min, max] = DELAY_BETWEEN_PAGES;
-  return Math.floor(Math.random() * (max - min) + min);
+  return randomInt(min, max);
 }
 
 function isRetryableError(err) {
@@ -88,10 +116,13 @@ function loadProducts() {
 
 // ── Browser context factory ─────────────────────────────
 async function createContext(browser) {
+  const ua = randomFrom(USER_AGENTS);
+  const viewport = { width: randomInt(1280, 1921), height: randomInt(800, 1081) };
+  if (DEBUG) console.log(`   [debug] UA: ${ua.substring(0, 60)}... | Viewport: ${viewport.width}x${viewport.height}`);
+
   const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    viewport: { width: 1280, height: 800 },
+    userAgent: ua,
+    viewport,
     locale: "en-US",
     extraHTTPHeaders: {
       "Accept-Language": "en-US,en;q=0.9",
@@ -314,6 +345,12 @@ async function main() {
     return;
   }
 
+  // --dry-run: just show counts and exit
+  if (DRY_RUN) {
+    console.log("(dry run — exiting without scraping)");
+    return;
+  }
+
   const browser = await chromium.launch({
     headless: HEADLESS,
     args: ["--disable-blink-features=AutomationControlled"],
@@ -327,10 +364,51 @@ async function main() {
     return;
   }
 
+  // ── Canary test: verify extraction logic works ──
+  console.log("🐤 Running canary test...");
+  let canaryPassed = 0;
+  for (const canary of CANARY_PRODUCTS) {
+    const url = `${BASE_URL}${canary.url}`;
+    try {
+      const captured = setupApiInterceptor(page);
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT });
+      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+      await sleep(1000);
+      await page.evaluate(() => {
+        const ugc = document.querySelector("ugc-pdp-review");
+        if (ugc) ugc.scrollIntoView({ behavior: "instant", block: "center" });
+      });
+      try {
+        await page.waitForFunction(
+          () => document.querySelector("ugc-pdp-review")?.shadowRoot?.textContent?.trim().length > 50,
+          { timeout: 15_000 }
+        );
+      } catch {}
+      await sleep(1000);
+      const domResult = await extractFromDOM(page);
+      const summary = domResult.summary || (typeof captured.summary === "string" ? captured.summary : null);
+      if (summary && summary.length >= MIN_SUMMARY_LENGTH) {
+        console.log(`   ✅ Canary ${canary.id}: OK`);
+        canaryPassed++;
+      } else {
+        console.log(`   ❌ Canary ${canary.id}: no summary extracted`);
+      }
+    } catch (e) {
+      console.log(`   ❌ Canary ${canary.id}: ${e.message}`);
+    }
+  }
+  if (canaryPassed === 0) {
+    console.error("\n❌ All canary tests failed — extraction logic may be broken. Aborting.");
+    await browser.close();
+    return;
+  }
+  console.log(`   Canary: ${canaryPassed}/${CANARY_PRODUCTS.length} passed\n`);
+
   let successCount = 0;
   let errorCount = 0;
   let consecutiveFails = 0;
   const startTime = Date.now();
+  let nextBatchPause = randomInt(BATCH_PAUSE_INTERVAL[0], BATCH_PAUSE_INTERVAL[1] + 1);
 
   // Scrape each product
   for (let i = 0; i < todo.length; i++) {
@@ -509,6 +587,14 @@ async function main() {
       consecutiveFails = 0;
     }
 
+    // ── Batch pause (every 80-120 products, randomized) ──
+    if (i > 0 && i >= nextBatchPause) {
+      const pauseMs = randomInt(BATCH_PAUSE_DURATION[0], BATCH_PAUSE_DURATION[1] + 1);
+      console.log(`\n☕ Batch pause at product ${i} (${(pauseMs / 1000).toFixed(0)}s)...`);
+      await sleep(pauseMs);
+      nextBatchPause = i + randomInt(BATCH_PAUSE_INTERVAL[0], BATCH_PAUSE_INTERVAL[1] + 1);
+    }
+
     // Random delay between pages
     if (i < todo.length - 1) {
       const delay = randomDelay();
@@ -517,9 +603,14 @@ async function main() {
     }
   }
 
+  // ── Auto summary ──
+  const elapsed = Date.now() - startTime;
+  const elapsedMin = (elapsed / 60_000).toFixed(1);
   const heapMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+  const summaryCount = successCount - errorCount;
   console.log(`\n🏁 Done! Results appended to ${RESULTS_FILE}`);
-  console.log(`   Success: ${successCount}, Errors: ${errorCount}`);
+  console.log(`   Processed: ${todo.length} | Success: ${successCount} | Errors: ${errorCount}`);
+  console.log(`   Duration: ${elapsedMin} min | Avg: ${(elapsed / todo.length / 1000).toFixed(1)}s/product`);
   console.log(`   Final heap: ${heapMB} MB`);
   await browser.close();
 }
