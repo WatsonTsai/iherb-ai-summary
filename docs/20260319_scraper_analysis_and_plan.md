@@ -34,7 +34,7 @@ iherb-ai-summary/
 │
 ├─ Step2: scrape.mjs
 │  ├─ 目的: 用 Playwright 爬取 AI summary
-│  ├─ 流程: 首頁建立 session → 人工通過 Cloudflare → 逐頁爬取
+│  ├─ 流程: 首頁建立 session → stealth plugin 自動通過 Cloudflare → 逐頁爬取
 │  ├─ 資料提取:
 │  │  ├─ DOM: ugc-pdp-review shadow DOM → AI summary 文字
 │  │  ├─ API 攔截: /tag/ai/{id} → Review Highlights 標籤
@@ -121,52 +121,69 @@ iherb-ai-summary/
 | 0-9 | 6,030 | 12.0% |
 | **Total** | **50,165** | **100%** |
 
-### 覆蓋率取樣 (待執行)
+### 覆蓋率取樣結果 (2026-03-19 完成)
 
-已準備 49 筆分層取樣產品 (`data/products.json`)：
-- 跨 10+ 品牌 (NOW Foods, Swanson, CGN, Solaray, Nature's Way, Frontier Co-op, etc.)
-- 跨 4 個評論數區間 (10+, 100+, 1000+, 10000+)
-- 跨多個類別 (Supplements, Grocery, Bath, Beauty, Baby, Sports)
+49 筆分層取樣，跨 10+ 品牌、4 個評論數區間、多個類別 (Supplements, Grocery, Bath, Beauty, Baby, Sports)。**0 個錯誤，Cloudflare 全自動通過。**
 
-執行後可估算真實覆蓋率。
+#### 總覽
 
-## Cloudflare 限制
+| 指標 | 數值 |
+|------|------|
+| 有 AI Summary | **37/59 (62.7%)** |
+| 有 Tags | **41/59 (69.5%)** |
+| 有 Rating | **54/59 (91.5%)** |
+| 錯誤 | **0** |
+
+#### 覆蓋率 vs 評論數
+
+| 評論數 | 覆蓋率 | DB 中產品數 | 預估有 summary |
+|--------|--------|------------|----------------|
+| 10,000+ | **89%** (17/19) | 1,636 | ~1,456 |
+| 1,000-9,999 | **81%** (13/16) | 9,783 | ~7,924 |
+| 100-999 | **50%** (7/14) | 17,348 | ~8,674 |
+| 10-99 | **0%** (0/10) | 15,368 | ~0 |
+| **Total** | | **44,135** | **~18,054** |
+
+**結論：評論數與 AI summary 覆蓋率高度相關。10,000+ 評論的產品有 89% 覆蓋率，100 以下幾乎為零。**
+
+## Cloudflare 處理
 
 - iHerb 使用 Cloudflare managed challenge
-- **每次啟動 scraper 需人工介入通過驗證** (debug 模式下手動 click)
-- Headless 模式無法自動通過
+- 已整合 `playwright-extra` + `puppeteer-extra-plugin-stealth`
+- **Headless 模式可自動通過 Cloudflare**，不需人工介入 (2026-03-19 驗證)
 - `cf_clearance` cookie 有效期約 **30-60 分鐘**
 - 建議每 45 分鐘（約 150-200 筆產品）重新建立 session
-- 可考慮將 cookies 持久化到磁碟，重啟時嘗試復用以減少人工介入
+- 若 stealth 未來失效，退回 `npm run scrape:debug` 人工通過
 
 ## 全量爬取執行計畫
 
-### Phase 1: 覆蓋率取樣 (49 筆)
+### Phase 1: 覆蓋率取樣 ✅ 已完成
 
-```bash
-# 取樣清單已就緒
-DEBUG=1 node scripts/scrape.mjs --force
-# 人工通過 Cloudflare 後等待完成
-# 預計耗時: ~15 分鐘
-```
-
-分析結果後決定目標範圍。
+49 筆分層取樣，結果如上。
 
 ### Phase 2: 全量爬取
 
-```bash
-# 依覆蓋率結果選擇範圍，例如 1000+ 評論 (~9,800 筆)
-node scripts/generate-products.mjs --min-reviews 1000
-node scripts/scrape.mjs   # 增量模式，可中斷再繼續
-```
+兩種策略可選：
 
-- 每筆約 15-20 秒（含等待 + delay）
-- 9,800 筆約需 **40-55 小時**，需分批執行
-- 增量模式：已爬的自動跳過，中斷後 re-run 即可接續
+**策略 A — 高效率 (建議)**
+```bash
+node scripts/generate-products.mjs --min-reviews 1000   # ~11,400 筆
+node scripts/scrape.mjs                                  # 增量模式
+```
+- 預期覆蓋率 ~83%，約取得 **~9,400 筆** AI summary
+- 每筆 ~15 秒，預計 **~48 小時**
+- 可中斷再繼續（增量模式）
+
+**策略 B — 最大範圍**
+```bash
+node scripts/generate-products.mjs --min-reviews 100    # ~28,700 筆
+node scripts/scrape.mjs
+```
+- 涵蓋更多產品，但 100-999 區間覆蓋率僅 50%
+- 預計 **~120 小時**，約一半產品無 summary
 
 ### Phase 3: 品質驗證與清理
 
-爬完後驗證資料品質：
 ```bash
 node -e "
 const d = JSON.parse(require('fs').readFileSync('data/summaries.json'));
@@ -201,7 +218,8 @@ console.log('Errors:', errors);
 
 ## 注意事項
 
-- **Cloudflare**: 每次啟動需人工介入，建議用 `npm run scrape:debug` 開瀏覽器視窗
+- **Cloudflare**: stealth plugin 目前可自動通過；若未來失效，改用 `npm run scrape:debug` 人工通過
 - **增量模式**: 預設跳過已爬取的產品，使用 `--force` 強制重爬
-- **台灣 IP**: 會被 redirect 到 `tw.iherb.com`，目前不影響功能但 URL 會不同
+- **台灣 IP**: 會被 redirect 到 `tw.iherb.com`，不影響功能但 URL 會不同
 - **data/summaries.json**: 不進 git (已在 .gitignore)，是累積式檔案，勿手動刪除
+- **低評論產品**: 10-99 則評論的產品覆蓋率為 0%，不建議爬取
