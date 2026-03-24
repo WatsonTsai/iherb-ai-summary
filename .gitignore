@@ -2,9 +2,14 @@ node_modules/
 input/
 data/summaries.json
 data/summaries.jsonl
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/scrape/
 
 # Environment & editor
-.env*
+.env
+.env.local
 *.log
 .DS_Store
 .vscode/

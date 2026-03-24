@@ -19,7 +19,7 @@ iHerb 產品頁面上有一個 "What Customers Say" 區塊，包含：
 | `/api/product/{id}/review/summary/v2` | 評論統計（評分、語言分布、精選評論），**不是** AI 摘要文字 |
 | `/api/tag/ai/{id}` | AI 生成的 Review Highlights 標籤 |
 
-> 注意：API 端點有 CORS 限制且受 Cloudflare 保護，無法直接用 curl/fetch 存取。必須透過真實瀏覽器。
+> 注意：`/tag/ai/{id}` 可透過 `ih-experiment` cookie 直接存取（見 `fetch-tags.mjs`）；`/review/summary/v2` 可直接 HTTP 存取但受 Cloudflare rate limit。AI 摘要段落仍需透過瀏覽器從 DOM 提取。
 
 ### Data Source
 
@@ -29,27 +29,33 @@ iHerb 產品頁面上有一個 "What Customers Say" 區塊，包含：
 
 - **Node.js** (ESM, .mjs)
 - **Playwright** (via `playwright-extra` + stealth plugin) — 瀏覽器自動化，繞過 Cloudflare 保護
-- **better-sqlite3** — 讀取 iherb.db 產品資料
+- **better-sqlite3** — 讀取 iherb.db 產品資料 + 輸出 iherb_summaries.db
 
 ## Key Commands
 
 ```bash
 npm run generate                        # 從 DB 生成 products.json
-npm run scrape                          # Headless 爬取
+npm run scrape                          # Headless 爬取 AI summary (2 parallel contexts)
 npm run scrape:debug                    # 開瀏覽器視窗爬取
-npm run stats                           # 統計 summaries.jsonl 結果分布
-npm run convert                         # 一次性遷移 summaries.json → .jsonl
+npm run fetch:tags                      # API 爬取 review tags (快速, 需 ih-experiment cookie)
+npm run fetch:ratings                   # API 爬取 rating distribution (快速, 無需 auth)
+npm run import                          # 一次性遷移 summaries.jsonl → SQLite
+npm run stats                           # 統計 iherb_summaries.db
 npm test                                # 執行 extractSummary 單元測試
+node scripts/scrape.mjs --dry-run       # 預覽待爬數量
 node scripts/scrape.mjs --force         # 強制重爬
+CONTEXTS=3 node scripts/scrape.mjs      # 3 個並行 context
 node scripts/generate-products.mjs --min-reviews 5000 --limit 50
 ```
 
 ## Architecture Notes
 
-- Scraper 的 AI 摘要文字提取**優先從 DOM 讀取**（web component 渲染後的文字），而非 API 回應
-- `/review/summary/v2` 回傳的是評論統計資料（rating, top reviews），腳本只取其中的 rating
-- `/tag/ai/{id}` 回傳的 tag 陣列才是 Review Highlights
+- **三種資料來源**：瀏覽器爬 AI summary 段落、API 爬 tags（含 sentiment）、API 爬 rating distribution
+- 所有資料寫入同一個 SQLite DB（`data/iherb_summaries.db`），透過 `scripts/lib/db.mjs` 的 UPSERT 各自更新不同欄位
+- Scraper 的 AI 摘要文字提取**優先從 DOM 讀取**（web component 渲染後的文字）
+- `/review/summary/v2` 回傳評論統計資料（rating distribution），可直接 HTTP 存取
+- `/tag/ai/{id}` 回傳 Review Highlights 標籤，需 `ih-experiment` cookie
 - 爬蟲支援增量模式：已爬取的產品會跳過，除非使用 `--force`
-- 輸出格式為 JSONL（每行一筆 JSON，append-only），避免大量資料時的 I/O 瓶頸
+- 瀏覽器爬蟲支援 2+ 並行 context（`CONTEXTS` 環境變數），共用 SQLite WAL mode 寫入
 - Regex patterns 定義在 `scripts/lib/extract.mjs`，scrape.mjs 透過參數傳入 browser context
-- `data/summaries.jsonl` 不進 git，`input/` 不進 git
+- `data/iherb_summaries.db` 不進 git，`input/` 不進 git
