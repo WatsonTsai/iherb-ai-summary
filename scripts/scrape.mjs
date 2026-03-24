@@ -24,7 +24,7 @@ const RETRY_ATTEMPTS = 3;
 const RETRY_BASE_DELAY = 2000;
 const PAGE_RECYCLE_INTERVAL = 50;
 const CONTEXT_RECYCLE_INTERVAL = 200;
-const MIN_SUMMARY_LENGTH = 20;
+const MIN_SUMMARY_LENGTH = 80;
 const CONSECUTIVE_FAIL_THRESHOLD = 3;
 const SESSION_REFRESH_PAUSE = 60_000;
 const BATCH_PAUSE_INTERVAL = [80, 120]; // pause every N products (random range)
@@ -91,7 +91,10 @@ function loadScrapedIds() {
   const lines = readFileSync(RESULTS_FILE, "utf-8").split("\n").filter(Boolean);
   const ids = new Set();
   for (const line of lines) {
-    try { ids.add(String(JSON.parse(line).productId)); } catch {}
+    try {
+      const entry = JSON.parse(line);
+      if (!entry.error) ids.add(String(entry.productId));
+    } catch {}
   }
   return ids;
 }
