@@ -26,7 +26,7 @@ const RETRY_BASE_DELAY = 2000;
 const PAGE_RECYCLE_INTERVAL = 50;
 const CONTEXT_RECYCLE_INTERVAL = 200;
 const MIN_SUMMARY_LENGTH = 80;
-const CONSECUTIVE_FAIL_THRESHOLD = 3;
+const CONSECUTIVE_FAIL_THRESHOLD = 5;
 const SESSION_REFRESH_PAUSE = 60_000;
 const BATCH_PAUSE_INTERVAL = [150, 200];
 const BATCH_PAUSE_DURATION = [15_000, 30_000];
@@ -271,12 +271,7 @@ async function scrapeQueue(browser, queue, db, label) {
           tags: domResult.tags.map((t) => (typeof t === "string" ? { name: t } : t)),
         });
         successCount++;
-
-        if (!summary && (!domResult.tags || domResult.tags.length === 0)) {
-          consecutiveFails++;
-        } else {
-          consecutiveFails = 0;
-        }
+        consecutiveFails = 0; // successful page load = session is fine
 
         if (summary) {
           console.log(`[${label}] ✅ ${productId}: ${summary.substring(0, 80)}...`);

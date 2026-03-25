@@ -7,6 +7,9 @@ data/*.db-wal
 data/*.db-shm
 data/scrape/
 
+# Claude Code
+.claude/
+
 # Environment & editor
 .env
 .env.local
