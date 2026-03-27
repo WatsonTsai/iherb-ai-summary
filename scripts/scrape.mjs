@@ -134,29 +134,18 @@ async function establishSession(page, label = "") {
 async function extractFromDOM(page) {
   return page.evaluate(async (patterns) => {
     const { summaryPattern, fallbackPattern } = patterns;
-    const out = { summary: null, tags: [], productId: null, _shadowTextPreview: null };
+    const out = { summary: null, tags: [], productId: null };
 
     const ugcEl = document.querySelector("ugc-pdp-review");
     out.productId = ugcEl?.getAttribute("product-id") || null;
+    if (!ugcEl) return out;
 
-    if (ugcEl) {
-      for (let i = 0; i < 30; i++) {
-        const sr = ugcEl.shadowRoot;
-        if (sr && sr.textContent && sr.textContent.trim().length > 50) break;
-        await new Promise((r) => setTimeout(r, 500));
-      }
-    }
-
-    function getDeepText(root) {
-      let text = "";
-      if (!root) return text;
-      for (const node of root.childNodes) {
-        if (node.nodeType === 3) text += node.textContent;
-        else if (node.nodeType === 1) {
-          text += node.shadowRoot ? getDeepText(node.shadowRoot) : getDeepText(node);
-        }
-      }
-      return text;
+    // Wait for component to hydrate (light DOM or shadow DOM)
+    for (let i = 0; i < 30; i++) {
+      const hasContent = ugcEl.textContent && ugcEl.textContent.trim().length > 50;
+      const hasShadow = ugcEl.shadowRoot?.textContent?.trim().length > 50;
+      if (hasContent || hasShadow) break;
+      await new Promise((r) => setTimeout(r, 500));
     }
 
     const SUMMARY_RE = new RegExp(summaryPattern, "i");
@@ -170,27 +159,40 @@ async function extractFromDOM(page) {
       return null;
     }
 
-    const shadow = ugcEl?.shadowRoot;
-    if (shadow) {
-      const fullText = getDeepText(shadow);
-      out._shadowTextPreview = fullText.substring(0, 300);
-      out.summary = extractSummary(fullText);
-      const tagEls = shadow.querySelectorAll("[class*='tag'], [class*='highlight'], [class*='chip']");
-      out.tags = Array.from(tagEls).map((el) => el.textContent?.trim()).filter((t) => t && t.length > 2 && t.length < 100);
+    // ── Strategy 1: Light DOM text (current iHerb layout) ──
+    const fullText = ugcEl.textContent || "";
+    out.summary = extractSummary(fullText);
+    if (out.summary) {
+      const idx = out.summary.indexOf("Review highlights");
+      if (idx > 0) out.summary = out.summary.substring(0, idx).trim();
     }
 
-    if (!out.summary) {
-      for (const el of document.querySelectorAll("p, div, span, section")) {
-        const text = el.textContent?.trim() || "";
-        if (text.length > 80 && text.length < 2000) {
-          const found = extractSummary(text);
-          if (found) {
-            const idx = found.indexOf("Review highlights");
-            out.summary = idx > 0 ? found.substring(0, idx).trim() : found;
-            break;
-          }
+    // ── Strategy 3: Shadow DOM (legacy layout) ──
+    if (!out.summary && ugcEl.shadowRoot) {
+      function getDeepText(root) {
+        let text = "";
+        if (!root) return text;
+        for (const node of root.childNodes) {
+          if (node.nodeType === 3) text += node.textContent;
+          else if (node.nodeType === 1) text += node.shadowRoot ? getDeepText(node.shadowRoot) : getDeepText(node);
         }
+        return text;
       }
+      const shadowText = getDeepText(ugcEl.shadowRoot);
+      out.summary = extractSummary(shadowText);
+      if (out.summary) {
+        const idx = out.summary.indexOf("Review highlights");
+        if (idx > 0) out.summary = out.summary.substring(0, idx).trim();
+      }
+    }
+
+    // ── Tags: try both layouts ──
+    const tagEls = ugcEl.querySelectorAll("[class*='tag'], [class*='highlight'], [class*='chip']");
+    if (tagEls.length > 0) {
+      out.tags = Array.from(tagEls).map((el) => el.textContent?.trim()).filter((t) => t && t.length > 2 && t.length < 100);
+    } else if (ugcEl.shadowRoot) {
+      const shadowTags = ugcEl.shadowRoot.querySelectorAll("[class*='tag'], [class*='highlight'], [class*='chip']");
+      out.tags = Array.from(shadowTags).map((el) => el.textContent?.trim()).filter((t) => t && t.length > 2 && t.length < 100);
     }
 
     return out;
@@ -250,7 +252,13 @@ async function scrapeQueue(browser, queue, db, label) {
 
         try {
           await page.waitForFunction(
-            () => document.querySelector("ugc-pdp-review")?.shadowRoot?.textContent?.trim().length > 50,
+            () => {
+              const el = document.querySelector("ugc-pdp-review");
+              if (!el) return false;
+              const lightText = el.textContent?.trim().length > 50;
+              const shadowText = el.shadowRoot?.textContent?.trim().length > 50;
+              return lightText || shadowText;
+            },
             { timeout: 15_000 }
           );
         } catch {}
